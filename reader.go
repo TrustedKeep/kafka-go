@@ -485,6 +485,9 @@ func (r *Reader) fetchOffsets(subs map[string][]int32) (map[int]int64, error) {
 		for _, partition := range partitions {
 			if partition == pr.Partition {
 				offset := pr.Offset
+				if offset < 0 {
+					offset = r.config.DefaultInitialOffset
+				}
 				offsetsByPartition[int(partition)] = offset
 			}
 		}
@@ -831,6 +834,10 @@ type ReaderConfig struct {
 	// Partition should NOT be specified e.g. 0
 	GroupID string
 
+	// DefaultInitialOffset controlls whether a new consumer group starts at the
+	// firstOffset or lastOffset.  Defaults to lastOffset.
+	DefaultInitialOffset int64
+
 	// The topic to read messages from.
 	Topic string
 
@@ -1047,6 +1054,10 @@ func NewReader(config ReaderConfig) *Reader {
 
 	if config.QueueCapacity == 0 {
 		config.QueueCapacity = 100
+	}
+
+	if config.DefaultInitialOffset == 0 {
+		config.DefaultInitialOffset = lastOffset
 	}
 
 	// when configured as a consumer group; stats should report a partition of -1

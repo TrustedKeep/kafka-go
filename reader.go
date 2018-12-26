@@ -1101,7 +1101,7 @@ func NewReader(config ReaderConfig) *Reader {
 	}
 
 	if config.DefaultInitialOffset == 0 {
-		config.DefaultInitialOffset = lastOffset
+		config.DefaultInitialOffset = LastOffset
 	}
 
 	// when configured as a consumer group; stats should report a partition of -1

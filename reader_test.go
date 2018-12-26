@@ -29,6 +29,11 @@ func TestReader(t *testing.T) {
 		},
 
 		{
+			scenario: "test special offsets -1 and -2",
+			function: testReaderSetSpecialOffsets,
+		},
+
+		{
 			scenario: "setting the offset to random values returns the expected messages when Read is called",
 			function: testReaderSetRandomOffset,
 		},
@@ -101,6 +106,39 @@ func testReaderReadMessages(t *testing.T, ctx context.Context, r *Reader) {
 		if v != i {
 			t.Error("message at index", i, "has wrong value:", v)
 			return
+		}
+	}
+}
+
+func testReaderSetSpecialOffsets(t *testing.T, ctx context.Context, r *Reader) {
+	prepareReader(t, ctx, r, Message{Value: []byte("first")})
+	prepareReader(t, ctx, r, makeTestSequence(3)...)
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		prepareReader(t, ctx, r, Message{Value: []byte("last")})
+	}()
+
+	for _, test := range []struct {
+		off, final int64
+		want       string
+	}{
+		{FirstOffset, 1, "first"},
+		{LastOffset, 5, "last"},
+	} {
+		offset := test.off
+		if err := r.SetOffset(offset); err != nil {
+			t.Error("setting offset", offset, "failed:", err)
+		}
+		m, err := r.ReadMessage(ctx)
+		if err != nil {
+			t.Error("reading at offset", offset, "failed:", err)
+		}
+		if string(m.Value) != test.want {
+			t.Error("message at offset", offset, "has wrong value:", string(m.Value))
+		}
+		if off := r.Offset(); off != test.final {
+			t.Errorf("bad final offset: got %d, want %d", off, test.final)
 		}
 	}
 }
@@ -222,6 +260,9 @@ func testReaderStats(t *testing.T, ctx context.Context, r *Reader) {
 		ClientID:      "",
 		Topic:         stats.Topic,
 		Partition:     "0",
+
+		// TODO: remove when we get rid of the deprecated field.
+		DeprecatedFetchesWithTypo: 1,
 	}
 
 	if stats != expect {
@@ -264,8 +305,8 @@ func createTopic(t *testing.T, topic string, partitions int) {
 	}
 	defer conn.Close()
 
-	_, err = conn.createTopics(createTopicsRequestV2{
-		Topics: []createTopicsRequestV2Topic{
+	_, err = conn.createTopics(createTopicsRequestV0{
+		Topics: []createTopicsRequestV0Topic{
 			{
 				Topic:             topic,
 				NumPartitions:     int32(partitions),
@@ -345,6 +386,38 @@ func testReaderSetsTopicAndPartition(t *testing.T, ctx context.Context, r *Reade
 		if m.Partition != r.config.Partition {
 			t.Errorf("expected partition to be set; expected 1, got %v", m.Partition)
 			return
+		}
+	}
+}
+
+// TestReadTruncatedMessages uses a configuration designed to get the Broker to
+// return truncated messages.  It exercises the case where an earlier bug caused
+// reading to time out by attempting to read beyond the current response.  This
+// test is not perfect, but it is pretty reliable about reproducing the issue.
+//
+// NOTE : it currently only succeeds against kafka 0.10.1.0, so it will be
+// skipped.  It's here so that it can be manually run.
+func TestReadTruncatedMessages(t *testing.T) {
+	// todo : it would be great to get it to work against 0.11.0.0 so we could
+	//        include it in CI unit tests.
+	t.Skip()
+
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	r := NewReader(ReaderConfig{
+		Brokers:  []string{"localhost:9092"},
+		Topic:    makeTopic(),
+		MinBytes: 1,
+		MaxBytes: 100,
+		MaxWait:  100 * time.Millisecond,
+	})
+	defer r.Close()
+	n := 500
+	prepareReader(t, ctx, r, makeTestSequence(n)...)
+	for i := 0; i < n; i++ {
+		if _, err := r.ReadMessage(ctx); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -505,7 +578,7 @@ func testConsumerGroupSimple(t *testing.T, ctx context.Context, r *Reader) {
 
 func TestReaderSetOffsetWhenConsumerGroupsEnabled(t *testing.T) {
 	r := &Reader{config: ReaderConfig{GroupID: "not-zero"}}
-	if err := r.SetOffset(-1); err != errNotAvailableWithGroup {
+	if err := r.SetOffset(LastOffset); err != errNotAvailableWithGroup {
 		t.Fatalf("expected %v; got %v", errNotAvailableWithGroup, err)
 	}
 }
@@ -546,45 +619,60 @@ func TestReaderPartitionWhenConsumerGroupsEnabled(t *testing.T) {
 }
 
 func TestExtractTopics(t *testing.T) {
-	newMeta := func(memberID string, topics ...string) memberGroupMetadata {
-		return memberGroupMetadata{
-			MemberID: memberID,
-			Metadata: groupMetadata{
-				Topics: topics,
-			},
-		}
-	}
-
 	testCases := map[string]struct {
-		Members []memberGroupMetadata
+		Members []GroupMember
 		Topics  []string
 	}{
 		"nil": {},
 		"single member, single topic": {
-			Members: []memberGroupMetadata{
-				newMeta("a", "topic"),
+			Members: []GroupMember{
+				{
+					ID:     "a",
+					Topics: []string{"topic"},
+				},
 			},
 			Topics: []string{"topic"},
 		},
 		"two members, single topic": {
-			Members: []memberGroupMetadata{
-				newMeta("a", "topic"),
-				newMeta("b", "topic"),
+			Members: []GroupMember{
+				{
+					ID:     "a",
+					Topics: []string{"topic"},
+				},
+				{
+					ID:     "b",
+					Topics: []string{"topic"},
+				},
 			},
 			Topics: []string{"topic"},
 		},
 		"two members, two topics": {
-			Members: []memberGroupMetadata{
-				newMeta("a", "topic-1"),
-				newMeta("b", "topic-2"),
+			Members: []GroupMember{
+				{
+					ID:     "a",
+					Topics: []string{"topic-1"},
+				},
+				{
+					ID:     "b",
+					Topics: []string{"topic-2"},
+				},
 			},
 			Topics: []string{"topic-1", "topic-2"},
 		},
 		"three members, three shared topics": {
-			Members: []memberGroupMetadata{
-				newMeta("a", "topic-1", "topic-2"),
-				newMeta("b", "topic-2", "topic-3"),
-				newMeta("c", "topic-3", "topic-1"),
+			Members: []GroupMember{
+				{
+					ID:     "a",
+					Topics: []string{"topic-1", "topic-2"},
+				},
+				{
+					ID:     "b",
+					Topics: []string{"topic-2", "topic-3"},
+				},
+				{
+					ID:     "c",
+					Topics: []string{"topic-3", "topic-1"},
+				},
 			},
 			Topics: []string{"topic-1", "topic-2", "topic-3"},
 		},
@@ -622,13 +710,13 @@ func TestReaderAssignTopicPartitions(t *testing.T) {
 		},
 	}
 
-	newJoinGroupResponseV2 := func(topicsByMemberID map[string][]string) joinGroupResponseV2 {
-		resp := joinGroupResponseV2{
-			GroupProtocol: roundrobinStrategy{}.ProtocolName(),
+	newJoinGroupResponseV1 := func(topicsByMemberID map[string][]string) joinGroupResponseV1 {
+		resp := joinGroupResponseV1{
+			GroupProtocol: RoundRobinGroupBalancer{}.ProtocolName(),
 		}
 
 		for memberID, topics := range topicsByMemberID {
-			resp.Members = append(resp.Members, joinGroupResponseMemberV2{
+			resp.Members = append(resp.Members, joinGroupResponseMemberV1{
 				MemberID: memberID,
 				MemberMetadata: groupMetadata{
 					Topics: topics,
@@ -640,58 +728,58 @@ func TestReaderAssignTopicPartitions(t *testing.T) {
 	}
 
 	testCases := map[string]struct {
-		Members     joinGroupResponseV2
-		Assignments memberGroupAssignments
+		Members     joinGroupResponseV1
+		Assignments GroupMemberAssignments
 	}{
 		"nil": {
-			Members:     newJoinGroupResponseV2(nil),
-			Assignments: memberGroupAssignments{},
+			Members:     newJoinGroupResponseV1(nil),
+			Assignments: GroupMemberAssignments{},
 		},
 		"one member, one topic": {
-			Members: newJoinGroupResponseV2(map[string][]string{
+			Members: newJoinGroupResponseV1(map[string][]string{
 				"member-1": {"topic-1"},
 			}),
-			Assignments: memberGroupAssignments{
-				"member-1": map[string][]int32{
+			Assignments: GroupMemberAssignments{
+				"member-1": map[string][]int{
 					"topic-1": {0, 1, 2},
 				},
 			},
 		},
 		"one member, two topics": {
-			Members: newJoinGroupResponseV2(map[string][]string{
+			Members: newJoinGroupResponseV1(map[string][]string{
 				"member-1": {"topic-1", "topic-2"},
 			}),
-			Assignments: memberGroupAssignments{
-				"member-1": map[string][]int32{
+			Assignments: GroupMemberAssignments{
+				"member-1": map[string][]int{
 					"topic-1": {0, 1, 2},
 					"topic-2": {0},
 				},
 			},
 		},
 		"two members, one topic": {
-			Members: newJoinGroupResponseV2(map[string][]string{
+			Members: newJoinGroupResponseV1(map[string][]string{
 				"member-1": {"topic-1"},
 				"member-2": {"topic-1"},
 			}),
-			Assignments: memberGroupAssignments{
-				"member-1": map[string][]int32{
+			Assignments: GroupMemberAssignments{
+				"member-1": map[string][]int{
 					"topic-1": {0, 2},
 				},
-				"member-2": map[string][]int32{
+				"member-2": map[string][]int{
 					"topic-1": {1},
 				},
 			},
 		},
 		"two members, two unshared topics": {
-			Members: newJoinGroupResponseV2(map[string][]string{
+			Members: newJoinGroupResponseV1(map[string][]string{
 				"member-1": {"topic-1"},
 				"member-2": {"topic-2"},
 			}),
-			Assignments: memberGroupAssignments{
-				"member-1": map[string][]int32{
+			Assignments: GroupMemberAssignments{
+				"member-1": map[string][]int{
 					"topic-1": {0, 1, 2},
 				},
-				"member-2": map[string][]int32{
+				"member-2": map[string][]int{
 					"topic-2": {0},
 				},
 			},
@@ -701,6 +789,10 @@ func TestReaderAssignTopicPartitions(t *testing.T) {
 	for label, tc := range testCases {
 		t.Run(label, func(t *testing.T) {
 			r := &Reader{}
+			r.config.GroupBalancers = []GroupBalancer{
+				RangeGroupBalancer{},
+				RoundRobinGroupBalancer{},
+			}
 			assignments, err := r.assignTopicPartitions(conn, tc.Members)
 			if err != nil {
 				t.Fatalf("bad err: %v", err)
@@ -1165,15 +1257,15 @@ type mockOffsetCommitter struct {
 	err         error
 }
 
-func (m *mockOffsetCommitter) offsetCommit(request offsetCommitRequestV3) (offsetCommitResponseV3, error) {
+func (m *mockOffsetCommitter) offsetCommit(request offsetCommitRequestV2) (offsetCommitResponseV2, error) {
 	m.invocations++
 
 	if m.failCount > 0 {
 		m.failCount--
-		return offsetCommitResponseV3{}, io.EOF
+		return offsetCommitResponseV2{}, io.EOF
 	}
 
-	return offsetCommitResponseV3{}, nil
+	return offsetCommitResponseV2{}, nil
 }
 
 func TestCommitOffsetsWithRetry(t *testing.T) {

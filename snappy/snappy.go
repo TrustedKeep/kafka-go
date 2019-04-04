@@ -42,6 +42,10 @@ var xerialHeader = []byte{130, 83, 78, 65, 80, 80, 89, 0}
 
 // From github.com/eapache/go-xerial-snappy
 func decode(src []byte) ([]byte, error) {
+	if len(src) < len(xerialHeader) {
+		return nil, kafka.ErrMalformed
+	}
+
 	if !bytes.Equal(src[:8], xerialHeader) {
 		return snappy.Decode(nil, src)
 	}

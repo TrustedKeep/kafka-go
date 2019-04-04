@@ -30,6 +30,8 @@ const (
 var (
 	errOnlyAvailableWithGroup = errors.New("unavailable when GroupID is not set")
 	errNotAvailableWithGroup  = errors.New("unavailable when GroupID is set")
+	// ErrMalformed is returned by the decoder when the xerial framing is malformed
+	ErrMalformed = errors.New("malformed xerial framing")
 )
 
 const (
@@ -1241,7 +1243,7 @@ func (r *Reader) Close() error {
 func (r *Reader) ReadMessage(ctx context.Context) (Message, error) {
 	m, err := r.FetchMessage(ctx)
 	if err != nil {
-		return Message{}, err
+		return m, err
 	}
 
 	if r.useConsumerGroup() {
@@ -1769,6 +1771,10 @@ func (r *reader) run(ctx context.Context, offset int64) {
 					})
 				}
 
+			case ErrMalformed:
+				r.sendErrorMessage(ctx, Message{Offset: offset}, err)
+				break readLoop
+
 			case context.Canceled:
 				// Another reader has taken over, we can safely quit.
 				conn.Close()
@@ -1916,6 +1922,15 @@ func (r *reader) sendMessage(ctx context.Context, msg Message, watermark int64) 
 func (r *reader) sendError(ctx context.Context, err error) error {
 	select {
 	case r.msgs <- readerMessage{version: r.version, error: err}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *reader) sendErrorMessage(ctx context.Context, msg Message, err error) error {
+	select {
+	case r.msgs <- readerMessage{version: r.version, message: msg, error: err}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
